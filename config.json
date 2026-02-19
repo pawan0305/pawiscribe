@@ -1,0 +1,11 @@
+{
+  "whisper_model": "base",
+  "language": "en",
+  "sample_rate": 16000,
+  "use_ollama": false,
+  "ollama_model": "llama3.2",
+  "auto_save": false,
+  "output_directory": "./notes",
+  "include_timestamps": true,
+  "summary_max_length": 500
+}

@@ -1,0 +1,132 @@
+═══════════════════════════════════════════════════════════════════════════════
+                         PAWISCRIBE - INSTALLATION GUIDE
+═══════════════════════════════════════════════════════════════════════════════
+
+                         NO PYTHON INSTALLATION REQUIRED!
+
+═══════════════════════════════════════════════════════════════════════════════
+
+QUICK START (3 STEPS)
+─────────────────────────────────────────────────────────────────────────────────
+
+1. DOWNLOAD
+   • Download PawiScribe.exe from the releases page
+   • File size: ~200-500 MB (includes Python runtime and all dependencies)
+
+2. SAVE
+   • Save PawiScribe.exe to your Desktop or any folder you prefer
+   • No installation folder needed - it's a single portable file!
+
+3. RUN
+   • Double-click PawiScribe.exe
+   • On first run, Windows Defender may show a warning (see below)
+   • The app will download the Whisper model on first use (~150 MB)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+WINDOWS DEFENDER WARNING
+─────────────────────────────────────────────────────────────────────────────────
+
+Since PawiScribe is not a commonly downloaded application, Windows Defender
+SmartScreen may show a warning. This is normal for independent software.
+
+TO ALLOW THE APP TO RUN:
+
+1. If you see "Windows protected your PC" or "Unknown publisher":
+   
+   → Click "More info"
+   → Click "Run anyway"
+
+2. If your antivirus flags the file:
+   
+   → Add an exception for PawiScribe.exe in your antivirus settings
+   → The file is safe - it's a local-only application with no network calls
+     except to download the Whisper speech model on first run
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM AUDIO SETUP (Optional but Recommended)
+─────────────────────────────────────────────────────────────────────────────────
+
+To capture meeting audio from Teams/Zoom/Meet (not just your microphone):
+
+ENABLE STEREO MIX IN WINDOWS:
+
+1. Right-click the speaker icon in your system tray → Click "Sounds"
+2. Go to the "Recording" tab
+3. Right-click in the empty area → Check "Show Disabled Devices"
+4. Look for "Stereo Mix" or "What U Hear"
+5. Right-click on it → Click "Enable"
+6. Click "OK" to save
+
+Note: Some laptops/sound cards don't have Stereo Mix. In that case, you can
+still use PawiScribe with just your microphone.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+FIRST RUN NOTES
+─────────────────────────────────────────────────────────────────────────────────
+
+• Initial startup may take 30-60 seconds as Python unpacks
+• First transcription will download the Whisper model (~150 MB)
+  - This is a one-time download
+  - The model is saved to: %USERPROFILE%\.cache\whisper\
+• Subsequent runs will be much faster
+
+═══════════════════════════════════════════════════════════════════════════════
+
+TROUBLESHOOTING
+─────────────────────────────────────────────────────────────────────────────────
+
+"App won't start"
+→ Make sure you're on Windows 10 or 11 (64-bit)
+→ Try right-clicking → "Run as administrator"
+
+"No audio devices found"
+→ Check that your microphone is connected
+→ Update your audio drivers from the manufacturer's website
+
+"Can only hear myself, not the meeting"
+→ Enable Stereo Mix (see above)
+→ Check "Capture system audio" in the app
+
+"Transcription is slow"
+→ Use the "base" or "tiny" model for faster results
+→ Close other applications to free up RAM
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM REQUIREMENTS
+─────────────────────────────────────────────────────────────────────────────────
+
+  OS:        Windows 10 or 11 (64-bit)
+  RAM:       4 GB minimum, 8 GB recommended
+  Storage:   1 GB free space (for app + models)
+  Audio:     Microphone required, Stereo Mix recommended
+  Internet:  Only needed for first-run model download
+
+═══════════════════════════════════════════════════════════════════════════════
+
+UNINSTALLING
+─────────────────────────────────────────────────────────────────────────────────
+
+Simply delete PawiScribe.exe. 
+
+To remove downloaded models and settings:
+  1. Delete the .exe file
+  2. Delete folder: %USERPROFILE%\.cache\whisper\
+  3. Delete any saved meeting notes in your Documents folder
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SUPPORT
+─────────────────────────────────────────────────────────────────────────────────
+
+For issues, feature requests, or questions:
+• Visit: https://github.com/yourusername/pawiscribe
+• Email: your-email@example.com
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                    Made with ❤️ for private, offline productivity
+═══════════════════════════════════════════════════════════════════════════════

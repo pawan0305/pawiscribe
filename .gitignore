@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Whisper models (large files)
+*.pt
+*.bin
+*.pth
+
+# Temporary files
+*.wav
+*.mp3
+*.m4a
+temp/
+tmp/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output files
+*.md
+!README.md
+
+# PyInstaller
+*.spec

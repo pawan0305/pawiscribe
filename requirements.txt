@@ -1,0 +1,26 @@
+# PawiScribe - Local Meeting Notetaker
+# Install with: pip install -r requirements.txt
+
+# GUI Framework
+PyQt6>=6.4.0
+
+# Audio Recording
+sounddevice>=0.4.6
+scipy>=1.10.0
+numpy>=1.24.0
+
+# Transcription
+openai-whisper>=20231117
+# Alternative: faster-whisper (CPU/GPU optimized)
+# faster-whisper>=0.10.0
+
+# Audio processing (required by whisper)
+torch>=2.0.0
+# Use torch-cpu for smaller install on CPU-only systems:
+# --index-url https://download.pytorch.org/whl/cpu
+
+# Optional but recommended
+tqdm>=4.65.0  # Progress bars
+
+# Note: On Windows, you may also need:
+# pip install pywin32  # For system audio capture (optional advanced feature)
