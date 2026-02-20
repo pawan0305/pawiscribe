@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 PawiScribe v2.0.0 - Local Meeting Notetaker - Apple Style UI
-Records audio (microphone + system audio), transcribes with Whisper, and summarizes with Ollama (optional)
+Records audio (microphone + system audio), transcribes with Whisper.
+Differentiates speakers using mic vs system audio energy.
 100% offline - no API calls required
 
 Author: PawiBot Team
@@ -13,6 +14,7 @@ __version__ = "2.0.0"
 import sys
 import os
 import io
+import json
 import wave
 import threading
 import datetime
@@ -21,6 +23,33 @@ import subprocess
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
+
+# Fix torch DLL loading on Windows (required for venvs / MS Store Python)
+if sys.platform == "win32":
+    _torch_lib = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "Lib", "site-packages", "torch", "lib")
+    if not os.path.isdir(_torch_lib):
+        # Fallback: find torch in the current Python's site-packages
+        try:
+            import importlib.util
+            _spec = importlib.util.find_spec("torch")
+            if _spec and _spec.origin:
+                _torch_lib = os.path.join(os.path.dirname(os.path.dirname(_spec.origin)), "torch", "lib")
+        except Exception:
+            _torch_lib = ""
+    if os.path.isdir(_torch_lib):
+        os.add_dll_directory(_torch_lib)
+
+    # Ensure ffmpeg is on PATH (winget installs may not be in inherited PATH)
+    _ffmpeg_winget = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "Microsoft", "WinGet", "Packages"
+    )
+    if os.path.isdir(_ffmpeg_winget):
+        for _root, _dirs, _files in os.walk(_ffmpeg_winget):
+            if "ffmpeg.exe" in _files:
+                if _root not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = _root + ";" + os.environ.get("PATH", "")
+                break
 
 try:
     import sounddevice as sd
@@ -37,12 +66,24 @@ except ImportError:
     WHISPER_AVAILABLE = False
 
 try:
+    from resemblyzer import VoiceEncoder, preprocess_wav
+    RESEMBLYZER_AVAILABLE = True
+except ImportError:
+    RESEMBLYZER_AVAILABLE = False
+
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPushButton, QTextEdit, QLabel, QProgressBar, QFileDialog,
         QMessageBox, QComboBox, QGroupBox, QCheckBox, QSpinBox,
         QDialog, QListWidget, QListWidgetItem, QFrame, QGraphicsDropShadowEffect,
-        QSizePolicy, QScrollArea, QSpacerItem
+        QSizePolicy, QScrollArea, QSpacerItem, QSplitter
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
     from PyQt6.QtGui import QFont, QClipboard, QColor
@@ -89,6 +130,8 @@ class AudioDevice:
     max_input_channels: int
     max_output_channels: int
     is_loopback: bool = False
+    default_samplerate: float = 48000.0
+    native_channels: int = 2
     
     def __str__(self):
         loopback_tag = " [LOOPBACK]" if self.is_loopback else ""
@@ -129,10 +172,13 @@ class AudioDeviceManager:
                     max_output_channels=dev['max_output_channels']
                 )
                 
-                if 'WASAPI' in hostapi_name and dev['max_input_channels'] > 0:
+                # Detect loopback-capable input devices across all host APIs
+                if dev['max_input_channels'] > 0:
                     name_lower = dev['name'].lower()
-                    if any(keyword in name_lower for keyword in ['loopback', 'stereo mix', 'what u hear']):
+                    if any(keyword in name_lower for keyword in ['loopback', 'stereo mix', 'what u hear', 'what you hear']):
                         device.is_loopback = True
+                        device.default_samplerate = dev.get('default_samplerate', 48000.0)
+                        device.native_channels = dev['max_input_channels']
                         self.loopback_devices.append(device)
                 
                 self.devices.append(device)
@@ -248,17 +294,41 @@ class DualAudioRecorder:
             self.mic_stream = None
     
     def _start_loopback_stream(self):
-        """Start the WASAPI loopback stream for system audio"""
+        """Start the loopback stream for system audio capture.
+        
+        Records at the device's native sample rate and resamples to
+        self.sample_rate in the callback so Whisper gets 16 kHz audio.
+        """
+        native_sr = self.loopback_device.default_samplerate
+        native_ch = min(self.loopback_device.native_channels, 2)  # cap at stereo
+        resample_ratio = native_sr / self.sample_rate  # e.g. 48000/16000 = 3
+
         def loopback_callback(indata, frames_count, time_info, status):
-            if self.recording:
-                self.system_audio_frames.append(indata.copy())
+            if not self.recording:
+                return
+            audio = indata.copy()
+            # Convert stereo to mono if needed
+            if native_ch > 1:
+                audio = audio.mean(axis=1, keepdims=True)
+            # Resample to target rate (simple decimation for integer ratios)
+            if resample_ratio > 1:
+                step = int(resample_ratio)
+                if abs(resample_ratio - step) < 0.01:  # clean integer ratio
+                    audio = audio[::step]
+                else:
+                    # Non-integer ratio — use linear interpolation
+                    n_out = int(len(audio) / resample_ratio)
+                    indices = np.linspace(0, len(audio) - 1, n_out).astype(int)
+                    audio = audio[indices]
+            self.system_audio_frames.append(audio)
         
         try:
-            print(f"Using loopback device: {self.loopback_device.name}")
+            print(f"Using loopback device: {self.loopback_device.name} "
+                  f"(native {int(native_sr)}Hz/{native_ch}ch, resampling to {self.sample_rate}Hz)")
             self.loopback_stream = sd.InputStream(
                 device=self.loopback_device.index,
-                samplerate=self.sample_rate,
-                channels=self.channels,
+                samplerate=native_sr,
+                channels=native_ch,
                 dtype=self.dtype,
                 callback=loopback_callback
             )
@@ -283,17 +353,52 @@ class DualAudioRecorder:
         
         return self._mix_audio()
     
-    def _mix_audio(self) -> Optional[np.ndarray]:
-        """Mix microphone and system audio into a single track"""
+    def get_recent_audio(self, last_n_frames: int = 0) -> Optional[np.ndarray]:
+        """Get audio collected so far without stopping recording.
+        If last_n_frames > 0, only return the most recent N frames."""
         mic_data = None
         loopback_data = None
-        
-        if self.microphone_frames:
-            mic_data = np.concatenate(self.microphone_frames, axis=0)
-        
-        if self.system_audio_frames:
-            loopback_data = np.concatenate(self.system_audio_frames, axis=0)
-        
+
+        mic_frames = list(self.microphone_frames)
+        sys_frames = list(self.system_audio_frames)
+
+        if last_n_frames > 0:
+            mic_frames = mic_frames[-last_n_frames:] if mic_frames else []
+            sys_frames = sys_frames[-last_n_frames:] if sys_frames else []
+
+        if mic_frames:
+            mic_data = np.concatenate(mic_frames, axis=0)
+        if sys_frames:
+            loopback_data = np.concatenate(sys_frames, axis=0)
+
+        return self._mix(mic_data, loopback_data)
+
+    def get_recent_audio_separate(self, last_n_frames: int = 0):
+        """Get mic and system audio separately for speaker detection.
+        Returns (mixed_audio, mic_energy, sys_energy)."""
+        mic_data = None
+        loopback_data = None
+
+        mic_frames = list(self.microphone_frames)
+        sys_frames = list(self.system_audio_frames)
+
+        if last_n_frames > 0:
+            mic_frames = mic_frames[-last_n_frames:] if mic_frames else []
+            sys_frames = sys_frames[-last_n_frames:] if sys_frames else []
+
+        if mic_frames:
+            mic_data = np.concatenate(mic_frames, axis=0)
+        if sys_frames:
+            loopback_data = np.concatenate(sys_frames, axis=0)
+
+        mic_energy = float(np.sqrt(np.mean(mic_data ** 2))) if mic_data is not None else 0.0
+        sys_energy = float(np.sqrt(np.mean(loopback_data ** 2))) if loopback_data is not None else 0.0
+
+        mixed = self._mix(mic_data, loopback_data)
+        return mixed, mic_energy, sys_energy
+
+    def _mix(self, mic_data, loopback_data) -> Optional[np.ndarray]:
+        """Mix two audio arrays"""
         if mic_data is not None and loopback_data is not None:
             min_len = min(len(mic_data), len(loopback_data))
             mic_data = mic_data[:min_len]
@@ -307,8 +412,20 @@ class DualAudioRecorder:
             return mic_data
         elif loopback_data is not None:
             return loopback_data
-        else:
-            return None
+        return None
+
+    def _mix_audio(self) -> Optional[np.ndarray]:
+        """Mix microphone and system audio into a single track"""
+        mic_data = None
+        loopback_data = None
+        
+        if self.microphone_frames:
+            mic_data = np.concatenate(self.microphone_frames, axis=0)
+        
+        if self.system_audio_frames:
+            loopback_data = np.concatenate(self.system_audio_frames, axis=0)
+        
+        return self._mix(mic_data, loopback_data)
     
     def save_to_wav(self, audio_data: np.ndarray, filepath: str) -> str:
         """Save audio data to WAV file"""
@@ -325,11 +442,10 @@ class TranscriptionWorker(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     
-    def __init__(self, audio_path, model_size="base", use_ollama=False):
+    def __init__(self, audio_path, model_size="base"):
         super().__init__()
         self.audio_path = audio_path
         self.model_size = model_size
-        self.use_ollama = use_ollama
         
     def run(self):
         try:
@@ -357,11 +473,7 @@ class TranscriptionWorker(QThread):
             
             formatted_transcript = self.format_transcript(result)
             
-            summary = ""
-            if self.use_ollama:
-                summary = self.generate_summary(transcript)
-            
-            output = self.create_markdown_output(formatted_transcript, summary)
+            output = self.create_markdown_output(formatted_transcript)
             
             self.finished.emit(output)
             
@@ -390,59 +502,7 @@ class TranscriptionWorker(QThread):
         secs = int(seconds % 60)
         return f"{mins:02d}:{secs:02d}"
     
-    def generate_summary(self, transcript):
-        """Generate summary using Ollama"""
-        try:
-            self.progress.emit("Generating summary with Ollama...")
-            
-            result = subprocess.run(
-                ["ollama", "list"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            
-            if result.returncode != 0:
-                return "(Ollama not available - skipping summary)"
-            
-            prompt = f"""Please provide a concise summary of the following meeting transcript. 
-Include key points, decisions made, and action items.
-
-Transcript:
-{transcript[:4000]}
-
-Summary:"""
-            
-            models_to_try = ["phi4", "llama3.2", "gemma2:2b", "llama3.1:latest"]
-            available_model = None
-            
-            for model in models_to_try:
-                check = subprocess.run(["ollama", "list"], capture_output=True, text=True)
-                if model in check.stdout:
-                    available_model = model
-                    break
-            
-            if not available_model:
-                return "(No suitable Ollama model found. Pull one with: ollama pull llama3.2)"
-            
-            result = subprocess.run(
-                ["ollama", "run", available_model, prompt],
-                capture_output=True,
-                text=True,
-                timeout=120
-            )
-            
-            if result.returncode == 0:
-                return result.stdout.strip()
-            else:
-                return f"(Summary generation failed: {result.stderr})"
-                
-        except subprocess.TimeoutExpired:
-            return "(Summary generation timed out)"
-        except Exception as e:
-            return f"(Summary unavailable: {str(e)})"
-    
-    def create_markdown_output(self, transcript, summary=""):
+    def create_markdown_output(self, transcript):
         """Create formatted markdown output"""
         now = datetime.datetime.now()
         date_str = now.strftime("%Y-%m-%d")
@@ -456,18 +516,6 @@ Summary:"""
 
 ---
 
-## Attendees
-
-- (Speaker names not automatically detected)
-
----
-
-## Summary
-
-{summary if summary else "(No summary generated - Ollama not available or disabled)"}
-
----
-
 ## Transcript
 
 {transcript}
@@ -478,6 +526,400 @@ Summary:"""
 """
         return output
 
+
+class SpeakerTracker:
+    """Tracks and distinguishes speakers using neural voice embeddings (d-vectors).
+
+    Uses the resemblyzer VoiceEncoder to compute speaker embeddings from audio.
+    Compares embeddings via cosine similarity — far more accurate than spectral
+    features for distinguishing different voices (male vs female, etc.).
+
+    Key design choices:
+    - Stores ALL embeddings per speaker (no running-average drift)
+    - Compares against the centroid of stored embeddings
+    - Keeps a capped history (max 20 embeddings per speaker) for efficiency
+    - Falls back to single-speaker mode if resemblyzer is not installed.
+    """
+
+    SIMILARITY_THRESHOLD = 0.69  # cosine similarity: same person ~0.75-0.95, diff male voices ~0.55-0.70
+    MAX_EMBEDDINGS = 20          # max stored embeddings per speaker
+    MIN_AUDIO_SECONDS = 0.8      # minimum audio duration for reliable embedding
+    MIN_NEW_SPEAKER_SECONDS = 1.5  # need at least this much audio to create a new speaker
+    CONSECUTIVE_MISSES_NEEDED = 2  # need N consecutive mismatches before creating a new speaker
+
+    def __init__(self, sample_rate: int = 16000, device: str = None):
+        self.sample_rate = sample_rate
+        self.profiles: list = []   # [{"label": str, "embeddings": [np.ndarray], "centroid": np.ndarray}]
+        self._next_id = 1
+        self._encoder = None
+        self._encoder_device = device  # "cpu" or "cuda"
+        self._encoder_loaded = False
+        self._miss_streak = 0         # consecutive chunks that didn't match any existing speaker
+        self._pending_embeddings = [] # embeddings collected during miss streak
+
+    def _get_encoder(self):
+        """Lazy-load the VoiceEncoder (downloads model on first use)."""
+        if self._encoder is None and RESEMBLYZER_AVAILABLE:
+            device = self._encoder_device
+            if device is None:
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._encoder = VoiceEncoder(device)
+            self._encoder_loaded = True
+        return self._encoder
+
+    def _embed(self, audio: np.ndarray):
+        """Compute a speaker embedding from an audio array. Returns None on failure."""
+        audio = audio.flatten().astype(np.float32)
+
+        # Skip near-silent audio
+        if np.sqrt(np.mean(audio ** 2)) < 1e-5:
+            return None
+
+        encoder = self._get_encoder()
+        if encoder is None:
+            return None
+
+        try:
+            processed = preprocess_wav(audio, source_sr=self.sample_rate)
+            min_samples = int(self.MIN_AUDIO_SECONDS * 16000)  # resemblyzer always uses 16 kHz
+            if len(processed) < min_samples:
+                return None
+            return encoder.embed_utterance(processed)
+        except Exception:
+            return None
+
+    def _cosine_sim(self, a: np.ndarray, b: np.ndarray) -> float:
+        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+    def _update_centroid(self, profile: dict):
+        """Recompute the centroid from stored embeddings."""
+        embs = np.stack(profile["embeddings"])
+        centroid = np.mean(embs, axis=0)
+        centroid /= np.linalg.norm(centroid) + 1e-8
+        profile["centroid"] = centroid
+
+    def identify(self, audio: np.ndarray, audio_duration: float = 0.0) -> str:
+        """Return a speaker label for the given audio chunk.
+        
+        Args:
+            audio: audio samples
+            audio_duration: duration in seconds (used to decide if enough for new speaker)
+        """
+        embedding = self._embed(audio)
+        if embedding is None:
+            return self.profiles[0]["label"] if self.profiles else "Speaker 1"
+
+        # Compare against centroids of all known speakers
+        best_match = None
+        best_sim = -1.0
+        for p in self.profiles:
+            sim = self._cosine_sim(embedding, p["centroid"])
+            if sim > best_sim:
+                best_sim = sim
+                best_match = p
+
+        if best_match is not None and best_sim >= self.SIMILARITY_THRESHOLD:
+            # Match — store embedding (capped) and recompute centroid
+            best_match["embeddings"].append(embedding)
+            if len(best_match["embeddings"]) > self.MAX_EMBEDDINGS:
+                best_match["embeddings"].pop(0)  # drop oldest
+            self._update_centroid(best_match)
+            self._miss_streak = 0
+            self._pending_embeddings = []
+            return best_match["label"]
+        else:
+            # No match — but don't create a new speaker immediately
+            self._miss_streak += 1
+            self._pending_embeddings.append(embedding)
+
+            # Only create a new speaker if:
+            # 1. There are no profiles yet (first speaker), OR
+            # 2. We have enough consecutive misses AND enough audio duration
+            should_create = (
+                not self.profiles or
+                (
+                    self._miss_streak >= self.CONSECUTIVE_MISSES_NEEDED and
+                    audio_duration >= self.MIN_NEW_SPEAKER_SECONDS
+                )
+            )
+
+            if should_create:
+                # Average all pending embeddings for a more stable initial profile
+                avg_emb = np.mean(np.stack(self._pending_embeddings), axis=0)
+                avg_emb /= np.linalg.norm(avg_emb) + 1e-8
+                label = f"Speaker {self._next_id}"
+                self._next_id += 1
+                self.profiles.append({
+                    "label": label,
+                    "embeddings": [avg_emb],
+                    "centroid": avg_emb.copy(),
+                })
+                self._miss_streak = 0
+                self._pending_embeddings = []
+                return label
+            else:
+                # Not enough evidence for new speaker — assign to best existing match
+                if best_match is not None:
+                    return best_match["label"]
+                return "Speaker 1"
+
+
+class RealtimeTranscriptionWorker(QThread):
+    """Worker that transcribes audio chunks in real-time while recording."""
+
+    new_text = pyqtSignal(str)       # emits each newly transcribed chunk
+    full_text_update = pyqtSignal(str)  # emits full cleaned transcript (replaces display)
+    model_ready = pyqtSignal()       # emits once the model is loaded
+    error = pyqtSignal(str)
+
+    CHUNK_SECONDS = 5                # transcribe every N seconds of new audio
+    OVERLAP_SECONDS = 1              # overlap with previous chunk for continuity
+    GEMINI_MODEL = "gemini-flash-lite-latest"
+    GEMINI_CLEANUP_EVERY = 120       # run Gemini cleanup every N chunks (~10 min at 5s/chunk)
+
+    def __init__(self, recorder: DualAudioRecorder, model_size: str = "base",
+                 ai_cleanup: bool = False, gemini_api_key: str = ""):
+        super().__init__()
+        self.recorder = recorder
+        self.model_size = model_size
+        self.ai_cleanup = ai_cleanup
+        self.gemini_api_key = gemini_api_key
+        self._stop_flag = False
+        self._model = None
+        self._gemini_model = None
+        self._gemini_thread = None     # background thread for async API calls
+        self._speaker_tracker = SpeakerTracker(sample_rate=recorder.sample_rate)
+        self._last_speaker = None
+        self._prev_tail = ""          # last few words of previous chunk for de-duplication
+        self._raw_chunks = []         # accumulated raw transcript chunks
+        self._chunk_count = 0         # counter for Gemini cleanup interval
+
+    def stop(self):
+        self._stop_flag = True
+
+    def _interruptible_sleep(self, seconds: float) -> bool:
+        """Sleep in small intervals so the thread can respond to stop quickly.
+        Returns True if interrupted (stop requested)."""
+        intervals = int(seconds * 4)  # 250ms intervals
+        for _ in range(intervals):
+            if self._stop_flag:
+                return True
+            self.msleep(250)
+        return self._stop_flag
+
+    def run(self):
+        try:
+            if not WHISPER_AVAILABLE:
+                self.error.emit("Whisper not installed.")
+                return
+
+            self._model = whisper.load_model(self.model_size)
+
+            # Pre-load the speaker encoder so first chunk isn't slow
+            self._speaker_tracker._get_encoder()
+
+            # Qwen loads lazily on first cleanup pass (see _ensure_qwen_loaded)
+
+            self.model_ready.emit()
+
+            overlap_frames = int(self.OVERLAP_SECONDS * self.recorder.sample_rate / 1024)
+            last_frame_count = 0
+
+            while not self._stop_flag:
+                if self._interruptible_sleep(self.CHUNK_SECONDS):
+                    break
+
+                current_mic = len(self.recorder.microphone_frames)
+                current_sys = len(self.recorder.system_audio_frames)
+                current_count = max(current_mic, current_sys)
+
+                if current_count <= last_frame_count:
+                    continue
+
+                # Grab frames with overlap from previous chunk for smoother joins
+                grab_from = max(0, last_frame_count - overlap_frames)
+                new_frames = current_count - grab_from
+                audio = self.recorder.get_recent_audio(last_n_frames=new_frames)
+                last_frame_count = current_count
+
+                if audio is None or len(audio) < self.recorder.sample_rate:
+                    continue
+
+                audio_np = audio.flatten().astype(np.float32)
+                if self._stop_flag:
+                    break
+                self._transcribe_and_emit(audio_np)
+
+            # Final pass: transcribe any remaining audio
+            if not self._stop_flag or True:  # always do final pass
+                remaining_mic = len(self.recorder.microphone_frames)
+                remaining_sys = len(self.recorder.system_audio_frames)
+                remaining_count = max(remaining_mic, remaining_sys)
+                if remaining_count > last_frame_count:
+                    new_frames = remaining_count - last_frame_count
+                    audio = self.recorder.get_recent_audio(last_n_frames=new_frames)
+                    if audio is not None and len(audio) >= self.recorder.sample_rate // 2:
+                        audio_np = audio.flatten().astype(np.float32)
+                        self._transcribe_and_emit(audio_np)
+
+        except Exception as e:
+            self.error.emit(f"Realtime transcription error: {str(e)}")
+
+    def _transcribe_and_emit(self, audio_np: np.ndarray):
+        """Transcribe an audio chunk, detect speaker per segment, and emit text."""
+        try:
+            use_fp16 = next(self._model.parameters()).is_cuda
+            result = self._model.transcribe(
+                audio_np,
+                verbose=False,
+                language="en",
+                fp16=use_fp16,
+            )
+
+            segments = result.get("segments", [])
+            if not segments:
+                return
+
+            sr = self.recorder.sample_rate
+            output_parts = []
+
+            for seg in segments:
+                seg_text = seg["text"].strip()
+                if not seg_text:
+                    continue
+
+                # Extract the audio slice for this segment using timestamps
+                start_sample = int(seg["start"] * sr)
+                end_sample = int(seg["end"] * sr)
+                seg_audio = audio_np[start_sample:end_sample]
+
+                seg_duration = seg["end"] - seg["start"]
+
+                # Need enough audio for a reliable embedding
+                if seg_duration < self._speaker_tracker.MIN_AUDIO_SECONDS:
+                    # Too short — attribute to the last known speaker
+                    speaker = self._last_speaker or "Speaker 1"
+                else:
+                    speaker = self._speaker_tracker.identify(seg_audio, audio_duration=seg_duration)
+
+                if speaker != self._last_speaker:
+                    self._last_speaker = speaker
+                    output_parts.append(f"\n\n**{speaker}:** {seg_text}")
+                else:
+                    output_parts.append(seg_text)
+
+            if output_parts:
+                combined = " ".join(output_parts)
+                # De-duplicate overlap
+                combined = self._remove_overlap(combined)
+                if combined.strip():
+                    self._raw_chunks.append(combined)
+                    self._chunk_count += 1
+                    self.new_text.emit(combined)
+
+                    # Run Gemini cleanup every ~10 min (async — doesn't block transcription)
+                    if (self.ai_cleanup and GEMINI_AVAILABLE and
+                            self._chunk_count % self.GEMINI_CLEANUP_EVERY == 0):
+                        self._ensure_gemini_ready()
+                        if self._gemini_model is not None:
+                            if self._gemini_thread is None or not self._gemini_thread.is_alive():
+                                snapshot = list(self._raw_chunks)
+                                self._gemini_thread = threading.Thread(
+                                    target=self._run_gemini_cleanup,
+                                    args=(snapshot,),
+                                    daemon=True,
+                                )
+                                self._gemini_thread.start()
+                                print(f"Gemini periodic cleanup triggered (chunk {self._chunk_count})")
+
+        except Exception as e:
+            print(f"Realtime transcription chunk error: {e}")
+
+    def get_raw_transcript(self) -> str:
+        """Return the accumulated raw transcript for post-processing."""
+        raw_text = " ".join(self._raw_chunks)
+        raw_text = raw_text.replace(" \n\n", "\n\n").replace("\n\n ", "\n\n")
+        return raw_text
+
+    def _ensure_gemini_ready(self):
+        """Configure Gemini client on first use."""
+        if self._gemini_model is not None:
+            return  # already configured
+        if not self.gemini_api_key:
+            print("No Gemini API key provided. AI cleanup disabled.")
+            self.ai_cleanup = False
+            return
+        try:
+            genai.configure(api_key=self.gemini_api_key)
+            self._gemini_model = genai.GenerativeModel(self.GEMINI_MODEL)
+            print(f"Gemini AI cleanup ready ({self.GEMINI_MODEL})")
+        except Exception as e:
+            print(f"Failed to configure Gemini: {e}. AI cleanup disabled.")
+            self.ai_cleanup = False
+
+    def _run_gemini_cleanup(self, chunks_snapshot: list):
+        """Run Gemini to fix misheard words (runs in a background thread, periodic during recording)."""
+        try:
+            raw_text = " ".join(chunks_snapshot)
+            raw_text = raw_text.replace(" \n\n", "\n\n").replace("\n\n ", "\n\n")
+
+            words = raw_text.split()
+
+            prompt = (
+                "You are an expert post-processor for raw voice transcripts produced by Whisper (an automatic speech recognition system). "
+                "Whisper converts speech to text but frequently mishears words, especially:\n"
+                "• Technical jargon, product names, abbreviations (e.g., 'air i' → 'AI', 'Jamie and I' → 'Gemini', 'see you for' → 'C4')\n"
+                "• Similar-sounding words used in wrong context (e.g., 'voltage strip' → 'raw transcript', 'soft working' → 'stopped working')\n"
+                "• Domain-specific terms from gaming, programming, business, medicine, etc. that get turned into common English words\n"
+                "• Compound words split or merged incorrectly\n"
+                "• Numbers, acronyms, and proper nouns mangled into regular words\n\n"
+                "How to fix:\n"
+                "1. Read each sentence and ask: does this make sense in the context of what's being discussed?\n"
+                "2. If a word/phrase seems out of place, think about what it SOUNDS like and what would make sense.\n"
+                "3. Use surrounding context to determine the topic and fix accordingly.\n"
+                "4. Be confident — if something reads as nonsense, it IS a recognition error. Fix it.\n"
+                "5. Keep the exact same sentence structure, speaker labels (**Speaker N:**), and formatting.\n"
+                "6. Do NOT rephrase, merge sentences, or restructure. Do NOT add commentary.\n"
+                "7. Output ONLY the corrected transcript, nothing else.\n\n"
+                f"Transcript:\n{raw_text}"
+            )
+
+            response = self._gemini_model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.3,
+                    max_output_tokens=len(words) + 500,
+                ),
+            )
+
+            cleaned = response.text.strip()
+            if cleaned and len(cleaned) > 20:
+                self.full_text_update.emit(cleaned)
+        except Exception as e:
+            print(f"Gemini periodic cleanup error: {e}")
+
+    def _remove_overlap(self, text: str) -> str:
+        """Remove repeated text from the overlap region between chunks."""
+        if not self._prev_tail:
+            self._prev_tail = text
+            return text
+
+        # Compare last N words of previous chunk with start of current chunk
+        prev_words = self._prev_tail.split()
+        curr_words = text.split()
+        max_overlap = min(len(prev_words), len(curr_words), 8)
+
+        best = 0
+        for length in range(1, max_overlap + 1):
+            if prev_words[-length:] == curr_words[:length]:
+                best = length
+
+        if best > 0:
+            text = " ".join(curr_words[best:])
+
+        self._prev_tail = " ".join(curr_words) if curr_words else text
+        return text
 
 
 class DeviceSelectorDialog(QDialog):
@@ -745,6 +1187,12 @@ class PawiScribeApp(QMainWindow):
         self.temp_dir = tempfile.mkdtemp()
         self.current_audio_path = None
         self.current_output = ""
+        self.realtime_worker = None
+        self.realtime_texts = []
+        self.gemini_api_key = ""
+        
+        # Load config
+        self._load_config()
         
         self.selected_mic_device = None
         self.selected_loopback_device = None
@@ -770,6 +1218,21 @@ class PawiScribeApp(QMainWindow):
         shadow.setColor(QColor(0, 0, 0, 15))
         card.setGraphicsEffect(shadow)
         return card
+
+    def _load_config(self):
+        """Load settings from config.json."""
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+                self.gemini_api_key = cfg.get("gemini_api_key", "")
+                if self.gemini_api_key:
+                    print("Gemini API key loaded from config.json")
+                else:
+                    print("No Gemini API key in config.json — AI cleanup will be disabled")
+        except Exception as e:
+            print(f"Could not load config.json: {e}")
     
     def get_checkbox_style(self):
         return f"""
@@ -1065,7 +1528,7 @@ class PawiScribeApp(QMainWindow):
         
         settings_layout.addLayout(device_row)
         
-        # Model and Ollama row
+        # Model row
         options_row = QHBoxLayout()
         options_row.setSpacing(16)
         
@@ -1079,9 +1542,16 @@ class PawiScribeApp(QMainWindow):
         self.model_combo.setStyleSheet(self.get_combo_style())
         options_row.addWidget(self.model_combo)
         
-        self.ollama_checkbox = QCheckBox("Use Ollama Summary")
-        self.ollama_checkbox.setStyleSheet(self.get_checkbox_style())
-        options_row.addWidget(self.ollama_checkbox)
+        self.realtime_checkbox = QCheckBox("Live Transcription")
+        self.realtime_checkbox.setChecked(True)
+        self.realtime_checkbox.setStyleSheet(self.get_checkbox_style())
+        options_row.addWidget(self.realtime_checkbox)
+
+        self.ai_cleanup_checkbox = QCheckBox("AI Cleanup")
+        self.ai_cleanup_checkbox.setChecked(True)
+        self.ai_cleanup_checkbox.setToolTip("Use Gemini Flash Lite to fix misheard words in real-time")
+        self.ai_cleanup_checkbox.setStyleSheet(self.get_checkbox_style())
+        options_row.addWidget(self.ai_cleanup_checkbox)
         
         options_row.addStretch()
         settings_layout.addLayout(options_row)
@@ -1124,8 +1594,23 @@ class PawiScribeApp(QMainWindow):
         output_layout.setSpacing(16)
         output_layout.setContentsMargins(20, 20, 20, 20)
         
-        output_header = QLabel("Meeting Notes")
-        output_header.setStyleSheet(f"""
+        # Splitter for side-by-side raw vs AI-cleaned transcripts
+        self.transcript_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.transcript_splitter.setMinimumHeight(200)
+        self.transcript_splitter.setStyleSheet(f"""
+            QSplitter::handle {{
+                background-color: {APPLE_GRAY_4};
+                width: 2px;
+            }}
+        """)
+
+        # --- Left pane: Raw transcript ---
+        raw_pane = QWidget()
+        raw_layout = QVBoxLayout(raw_pane)
+        raw_layout.setContentsMargins(0, 0, 4, 0)
+        raw_layout.setSpacing(6)
+        raw_header = QLabel("Raw Transcript")
+        raw_header.setStyleSheet(f"""
             font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
             font-size: 11px;
             font-weight: 600;
@@ -1133,14 +1618,38 @@ class PawiScribeApp(QMainWindow):
             text-transform: uppercase;
             letter-spacing: 0.5px;
         """)
-        output_layout.addWidget(output_header)
-        
+        raw_layout.addWidget(raw_header)
         self.output_text = QTextEdit()
-        self.output_text.setPlaceholderText("Transcript will appear here after recording...")
+        self.output_text.setPlaceholderText("Raw transcript will appear here...")
         self.output_text.setReadOnly(True)
-        self.output_text.setMinimumHeight(200)
         self.output_text.setStyleSheet(self.get_textedit_style())
-        output_layout.addWidget(self.output_text)
+        raw_layout.addWidget(self.output_text)
+        self.transcript_splitter.addWidget(raw_pane)
+
+        # --- Right pane: AI-cleaned transcript ---
+        ai_pane = QWidget()
+        ai_layout = QVBoxLayout(ai_pane)
+        ai_layout.setContentsMargins(4, 0, 0, 0)
+        ai_layout.setSpacing(6)
+        ai_header = QLabel("AI Cleaned")
+        ai_header.setStyleSheet(f"""
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            color: {APPLE_BLUE};
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        """)
+        ai_layout.addWidget(ai_header)
+        self.ai_output_text = QTextEdit()
+        self.ai_output_text.setPlaceholderText("AI-cleaned transcript will appear here...")
+        self.ai_output_text.setReadOnly(True)
+        self.ai_output_text.setStyleSheet(self.get_textedit_style())
+        ai_layout.addWidget(self.ai_output_text)
+        self.transcript_splitter.addWidget(ai_pane)
+
+        self.transcript_splitter.setSizes([500, 500])  # equal split
+        output_layout.addWidget(self.transcript_splitter)
         
         # Action buttons
         action_layout = QHBoxLayout()
@@ -1266,20 +1775,177 @@ class PawiScribeApp(QMainWindow):
             self.system_audio_checkbox.setEnabled(False)
             self.device_button.setEnabled(False)
             self.model_combo.setEnabled(False)
-            self.ollama_checkbox.setEnabled(False)
+            self.realtime_checkbox.setEnabled(False)
+            self.ai_cleanup_checkbox.setEnabled(False)
             self.recording_seconds = 0
             self.timer.start(1000)
             self.update_timer()
-            self.status_label.setText("Recording...")
+
+            # Start real-time transcription if enabled
+            if self.realtime_checkbox.isChecked():
+                self.realtime_texts = []
+                self.output_text.clear()
+                self.output_text.setPlaceholderText("")
+                self.ai_output_text.clear()
+                self.ai_output_text.setPlaceholderText("Waiting for AI cleanup pass...")
+                self.realtime_worker = RealtimeTranscriptionWorker(
+                    self.recorder, self.model_combo.currentText(),
+                    ai_cleanup=self.ai_cleanup_checkbox.isChecked(),
+                    gemini_api_key=self.gemini_api_key
+                )
+                self.realtime_worker.new_text.connect(self.on_realtime_text)
+                self.realtime_worker.full_text_update.connect(self.on_full_text_update)
+                self.realtime_worker.model_ready.connect(self.on_realtime_model_ready)
+                self.realtime_worker.error.connect(self.on_transcription_error)
+                self.realtime_worker.start()
+                self.status_label.setText("Loading model...")
+                self.status_label.setStyleSheet(f"""
+                    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+                    font-size: 14px;
+                    font-weight: 500;
+                    color: {APPLE_ORANGE};
+                    padding: 8px;
+                """)
+            else:
+                self.status_label.setText("Recording...")
+                self.status_label.setStyleSheet(f"""
+                    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+                    font-size: 14px;
+                    font-weight: 500;
+                    color: {APPLE_RED};
+                    padding: 8px;
+                """)
+        except Exception as e:
+            QMessageBox.critical(self, "Recording Error", str(e))
+
+    def on_realtime_model_ready(self):
+        """Called when the Whisper model finishes loading during recording."""
+        self.status_label.setText("Recording — Live transcription active")
+        self.status_label.setStyleSheet(f"""
+            font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+            font-weight: 500;
+            color: {APPLE_GREEN};
+            padding: 8px;
+        """)
+
+    def on_realtime_text(self, text):
+        """Handle new text from real-time transcription."""
+        if not text.strip():
+            return
+        self.realtime_texts.append(text)
+        # Join with space but preserve newlines from speaker changes
+        display = " ".join(self.realtime_texts)
+        # Clean up extra spaces around newlines
+        display = display.replace(" \n\n", "\n\n").replace("\n\n ", "\n\n")
+        self.output_text.setPlainText(display)
+        # Auto-scroll to bottom
+        scrollbar = self.output_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self.copy_button.setEnabled(True)
+        self.save_button.setEnabled(True)
+
+    def on_full_text_update(self, cleaned_text):
+        """Handle full transcript replacement from Gemini cleanup — goes to AI pane only."""
+        if not cleaned_text.strip():
+            return
+        # Show cleaned version in the AI pane (raw pane stays untouched)
+        self.ai_output_text.setPlainText(cleaned_text)
+        # Auto-scroll to bottom
+        scrollbar = self.ai_output_text.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _post_process_gemini(self, raw_transcript: str):
+        """Run a single Gemini call to clean up the entire transcript (background thread)."""
+        try:
+            genai.configure(api_key=self.gemini_api_key)
+            model = genai.GenerativeModel("gemini-flash-lite-latest")
+
+            words = raw_transcript.split()
+            prompt = (
+                "You are an expert post-processor for raw voice transcripts produced by Whisper (an automatic speech recognition system). "
+                "Your task has TWO parts:\n\n"
+
+                "═══ PART 1: TRANSCRIPT CORRECTION ═══\n"
+                "Whisper converts speech to text but frequently mishears words, especially:\n"
+                "• Technical jargon, product names, abbreviations (e.g., 'air i' → 'AI', 'Jamie and I' → 'Gemini', 'see you for' → 'C4')\n"
+                "• Similar-sounding words used in wrong context (e.g., 'voltage strip' → 'raw transcript', 'soft working' → 'stopped working')\n"
+                "• Domain-specific terms from gaming, programming, business, medicine, etc. that get turned into common English words\n"
+                "• Compound words split or merged incorrectly\n"
+                "• Numbers, acronyms, and proper nouns mangled into regular words\n\n"
+
+                "How to fix:\n"
+                "1. Read each sentence and ask: does this make sense in the context of what's being discussed?\n"
+                "2. If a word/phrase seems out of place, think about what it SOUNDS like and what would make sense.\n"
+                "3. Use surrounding context to determine the topic (e.g., if they're discussing a video game, "
+                "words like 'levees' probably mean 'levies', 'CV' means 'CB/casus belli', 'burger ones' means 'Burgundian').\n"
+                "4. Be confident — if something reads as nonsense, it IS a recognition error. Fix it.\n"
+                "5. Keep the exact same sentence structure, speaker labels (**Speaker N:**), and formatting.\n"
+                "6. Do NOT rephrase, merge sentences, or restructure the text.\n\n"
+
+                "═══ PART 2: MEETING SUMMARY ═══\n"
+                "After the corrected transcript, add a concise summary section with:\n"
+                "• A brief overview of what was discussed (2-4 sentences)\n"
+                "• Key topics or decisions mentioned\n"
+                "• Action items if any were mentioned\n"
+                "• Number of participants detected\n\n"
+
+                "═══ OUTPUT FORMAT ═══\n"
+                "Output EXACTLY in this format (no other commentary):\n\n"
+                "## Corrected Transcript\n\n"
+                "[corrected transcript here, preserving all Speaker labels and line breaks]\n\n"
+                "---\n\n"
+                "## Meeting Summary\n\n"
+                "**Overview:** [2-4 sentence summary]\n\n"
+                "**Key Topics:**\n"
+                "- [topic 1]\n"
+                "- [topic 2]\n\n"
+                "**Action Items:**\n"
+                "- [item, or 'None identified']\n\n"
+                "**Participants:** [N speaker(s) detected]\n\n"
+
+                f"═══ RAW TRANSCRIPT ═══\n{raw_transcript}"
+            )
+
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.3,
+                    max_output_tokens=len(words) + 1000,
+                ),
+            )
+
+            cleaned = response.text.strip()
+            if cleaned and len(cleaned) > 20:
+                self._gemini_result = cleaned
+            else:
+                self._gemini_result = "__FAILED__"
+        except Exception as e:
+            print(f"Gemini post-process error: {e}")
+            self._gemini_result = "__FAILED__"
+
+    def _check_gemini_done(self):
+        """Timer callback to check if the background Gemini cleanup finished."""
+        if hasattr(self, '_gemini_result') and self._gemini_result:
+            result = self._gemini_result
+            self._gemini_result = None
+            self._gemini_poll_timer.stop()
+
+            if result != "__FAILED__":
+                self.ai_output_text.setPlainText(result)
+                self.status_label.setText("Transcription complete! (AI cleaned)")
+            else:
+                self.ai_output_text.setPlainText("AI cleanup failed — see raw transcript")
+                self.status_label.setText("Transcription complete (AI cleanup failed)")
+
             self.status_label.setStyleSheet(f"""
                 font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
                 font-size: 14px;
                 font-weight: 500;
-                color: {APPLE_RED};
+                color: {APPLE_GREEN};
                 padding: 8px;
             """)
-        except Exception as e:
-            QMessageBox.critical(self, "Recording Error", str(e))
+            self.reset_ui_controls()
     
     def update_timer(self):
         """Update the recording timer display"""
@@ -1294,6 +1960,14 @@ class PawiScribeApp(QMainWindow):
             return
         self.timer.stop()
         self.status_label.setText("Processing...")
+
+        # Stop realtime worker first so it can do a final pass
+        if self.realtime_worker and self.realtime_worker.isRunning():
+            self.realtime_worker.stop()
+            if not self.realtime_worker.wait(15000):  # 15s for final transcription
+                print("Warning: realtime worker did not finish in time")
+            self.realtime_worker = None
+
         audio_data = self.recorder.stop_recording()
         self.is_recording = False
         self.record_button.set_recording(False)
@@ -1304,17 +1978,93 @@ class PawiScribeApp(QMainWindow):
             QMessageBox.warning(self, "Warning", "No audio recorded!")
             self.reset_ui()
             return
-        
+
+        # If realtime was on, we already have the transcript — generate final output
+        if self.realtime_checkbox.isChecked() and self.realtime_texts:
+            full_transcript = " ".join(self.realtime_texts)
+            now = datetime.datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            time_str = now.strftime("%H:%M")
+
+            output = f"""# Meeting Notes - {date_str}
+
+**Date:** {date_str}  
+**Time:** {time_str}  
+**Duration:** {self.recording_seconds // 60}m {self.recording_seconds % 60}s
+
+---
+
+## Transcript
+
+{full_transcript}
+
+---
+
+*Generated by PawiScribe - Local Meeting Notetaker (Live Transcription)*
+"""
+            self.current_output = output
+            self.output_text.setPlainText(output)
+            self.copy_button.setEnabled(True)
+            self.save_button.setEnabled(True)
+
+            # Run Gemini cleanup as a single post-processing pass
+            if (self.ai_cleanup_checkbox.isChecked() and GEMINI_AVAILABLE
+                    and self.gemini_api_key):
+                self.status_label.setText("Running AI cleanup...")
+                self.status_label.setStyleSheet(f"""
+                    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+                    font-size: 14px;
+                    font-weight: 500;
+                    color: {APPLE_ORANGE};
+                    padding: 8px;
+                """)
+                self.ai_output_text.setPlainText("Running AI cleanup...")
+                self._gemini_result = None
+                # Run in background thread so UI stays responsive
+                self._gemini_cleanup_thread = threading.Thread(
+                    target=self._post_process_gemini,
+                    args=(full_transcript,),
+                    daemon=True,
+                )
+                self._gemini_cleanup_thread.start()
+                # Poll every 500ms for completion
+                self._gemini_poll_timer = QTimer(self)
+                self._gemini_poll_timer.timeout.connect(self._check_gemini_done)
+                self._gemini_poll_timer.start(500)
+            else:
+                self.status_label.setText("Transcription complete!")
+                self.status_label.setStyleSheet(f"""
+                    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, sans-serif;
+                    font-size: 14px;
+                    font-weight: 500;
+                    color: {APPLE_GREEN};
+                    padding: 8px;
+                """)
+                self.reset_ui_controls()
+            return
+
+        # Otherwise, do the normal batch transcription
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_audio_path = os.path.join(self.temp_dir, f"recording_{timestamp}.wav")
         self.recorder.save_to_wav(audio_data, self.current_audio_path)
         self.start_transcription()
-    
+
+    def reset_ui_controls(self):
+        """Re-enable all settings controls after recording."""
+        self.record_button.set_recording(False)
+        self.record_button.setEnabled(True)
+        self.mic_checkbox.setEnabled(True)
+        self.system_audio_checkbox.setEnabled(True)
+        self.device_button.setEnabled(True)
+        self.model_combo.setEnabled(True)
+        self.realtime_checkbox.setEnabled(True)
+        self.ai_cleanup_checkbox.setEnabled(True)
+        self.timer_label.setVisible(False)
+
     def start_transcription(self):
         """Start the transcription worker thread"""
         model_size = self.model_combo.currentText()
-        use_ollama = self.ollama_checkbox.isChecked()
-        self.worker = TranscriptionWorker(self.current_audio_path, model_size, use_ollama)
+        self.worker = TranscriptionWorker(self.current_audio_path, model_size)
         self.worker.progress.connect(self.on_progress)
         self.worker.finished.connect(self.on_transcription_finished)
         self.worker.error.connect(self.on_transcription_error)
@@ -1343,7 +2093,6 @@ class PawiScribeApp(QMainWindow):
         self.save_button.setEnabled(True)
         self.record_button.setEnabled(True)
         self.model_combo.setEnabled(True)
-        self.ollama_checkbox.setEnabled(True)
         self.mic_checkbox.setEnabled(True)
         self.system_audio_checkbox.setEnabled(True)
         self.device_button.setEnabled(True)
@@ -1377,7 +2126,8 @@ class PawiScribeApp(QMainWindow):
         self.system_audio_checkbox.setEnabled(True)
         self.device_button.setEnabled(True)
         self.model_combo.setEnabled(True)
-        self.ollama_checkbox.setEnabled(True)
+        self.realtime_checkbox.setEnabled(True)
+        self.ai_cleanup_checkbox.setEnabled(True)
         self.progress_bar.setVisible(False)
         self.status_label.setText("Ready to record")
         self.status_label.setStyleSheet(f"""
@@ -1413,6 +2163,7 @@ class PawiScribeApp(QMainWindow):
     def clear_output(self):
         """Clear the output area"""
         self.output_text.clear()
+        self.ai_output_text.clear()
         self.current_output = ""
         self.copy_button.setEnabled(False)
         self.save_button.setEnabled(False)
@@ -1420,6 +2171,11 @@ class PawiScribeApp(QMainWindow):
     
     def closeEvent(self, event):
         """Clean up on close"""
+        if self.realtime_worker and self.realtime_worker.isRunning():
+            self.realtime_worker.stop()
+            if not self.realtime_worker.wait(10000):  # 10s grace period
+                self.realtime_worker.terminate()  # force kill as last resort
+                self.realtime_worker.wait(2000)
         try:
             import shutil
             if os.path.exists(self.temp_dir):

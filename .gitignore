@@ -40,3 +40,9 @@ Thumbs.db
 
 # PyInstaller
 *.spec
+
+# Local config with secrets (use config.json as template)
+config.local.json
+
+# Notes output
+notes/

@@ -1,335 +1,213 @@
-# PawiScribe - Local Meeting Notetaker
+# PawiScribe - Real-Time Meeting Notetaker
 
-A 100% offline meeting notetaker for Windows that records audio (microphone + system audio), transcribes with OpenAI Whisper, and optionally summarizes with Ollama.
+A real-time meeting notetaker for Windows that captures microphone + system audio, transcribes live with OpenAI Whisper on GPU, differentiates speakers using neural voice embeddings, and cleans up transcripts with Google Gemini AI.
 
 ![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-lightgrey.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
+![CUDA](https://img.shields.io/badge/CUDA-Supported-green.svg)
 
-## ✨ Features
+## Features
 
-- 🎤 **Dual Audio Recording** - Record both microphone AND system audio simultaneously
-- 🔊 **System Audio Capture** - Capture meeting audio from Teams/Zoom/Meet calls
-- 🤖 **Local Transcription** - Uses OpenAI Whisper (runs entirely offline)
-- 📝 **Smart Summaries** - Optional AI summaries via Ollama (local LLM)
-- 📄 **Markdown Export** - Clean, shareable meeting notes
-- 🔒 **100% Private** - No data leaves your computer
-- 💻 **Windows Native** - Built for Windows 10/11 with WASAPI loopback support
+- **Real-Time Transcription** — Live speech-to-text as you speak, 5-second chunked processing
+- **Dual Audio Capture** — Records microphone AND system audio simultaneously (Teams/Zoom/Meet)
+- **GPU Accelerated** — Whisper runs on CUDA for fast transcription
+- **Speaker Diarization** — Neural voice embeddings (resemblyzer) differentiate speakers automatically
+- **AI Transcript Cleanup** — Google Gemini corrects speech recognition errors and generates meeting summaries
+- **Periodic AI Cleanup** — Cleans transcript every ~10 minutes during long meetings, plus a final pass with meeting summary
+- **Dual-Pane UI** — Side-by-side view of raw transcript and AI-cleaned version
+- **Privacy-First** — Audio stays local; only text is sent to Gemini API (optional)
+- **Markdown Export** — Save or copy meeting notes as clean Markdown
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
 - Windows 10 or 11
-- Python 3.9 or higher ([Download](https://www.python.org/downloads/))
-- (Optional) Ollama for AI summaries ([Download](https://ollama.com/))
+- Python 3.9+ ([Download](https://www.python.org/downloads/))
+- NVIDIA GPU recommended (CUDA support for fast transcription)
+- [FFmpeg](https://ffmpeg.org/) installed and on PATH
+- (Optional) [Google Gemini API key](https://aistudio.google.com/apikey) for AI transcript cleanup
 
 ### Installation
 
-1. **Clone or download this repository:**
-   ```bash
-   git clone <repository-url>
-   cd pawiscribe
+```bash
+git clone https://github.com/pawan0305/pawiscribe.git
+cd pawiscribe
+pip install -r requirements.txt
+```
+
+For GPU acceleration, install PyTorch with CUDA:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+```
+
+> **Note:** First run will download the Whisper model (~150MB for the `base` model).
+
+### FFmpeg Setup
+
+PawiScribe requires FFmpeg. Install via winget:
+
+```bash
+winget install Gyan.FFmpeg
+```
+
+Or download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to your PATH.
+
+### Gemini API Key (Optional)
+
+For AI-powered transcript cleanup:
+
+1. Get a free API key from [Google AI Studio](https://aistudio.google.com/apikey)
+2. Add it to `config.json`:
+   ```json
+   {
+     "gemini_api_key": "YOUR_API_KEY_HERE"
+   }
    ```
+3. Enable the "AI Cleanup" checkbox in the app
 
-2. **Create a virtual environment (recommended):**
-   ```bash
-   python -m venv venv
-   venv\Scripts\activate
-   ```
+### Run
 
-3. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-   
-   > **Note:** First run will download the Whisper model (~150MB for base model)
+```bash
+python main.py
+```
 
-4. **Enable Stereo Mix for system audio capture** (see [System Audio Setup](#-system-audio-setup) below)
+Or double-click `Start PawiScribe.bat`.
 
-5. **Run the application:**
-   ```bash
-   python main.py
-   ```
+## System Audio Setup
 
-## 🎧 System Audio Setup
+To capture meeting audio (not just your microphone), enable **Stereo Mix** in Windows:
 
-To capture meeting audio from Teams/Zoom/Meet (not just your microphone), you need to enable **Stereo Mix** in Windows:
-
-### Enabling Stereo Mix (Windows 10/11)
-
-1. **Right-click** the speaker icon in your system tray → Click **"Sounds"**
-
+1. Right-click the speaker icon in system tray → **Sounds**
 2. Go to the **Recording** tab
+3. Right-click in the empty area → **Show Disabled Devices**
+4. Right-click **Stereo Mix** → **Enable**
+5. Click **OK**
 
-3. **Right-click** in the empty area → Check **"Show Disabled Devices"**
+### Alternatives
 
-4. Look for **"Stereo Mix"** or **"What U Hear"** in the list
+- **[VB-Cable](https://vb-audio.com/Cable/)** — Free virtual audio cable (if Stereo Mix isn't available)
+- **[VoiceMeeter](https://vb-audio.com/Voicemeeter/banana.htm)** — Advanced audio routing
 
-5. **Right-click** on it → Click **"Enable"**
+## Usage
 
-6. Click **"OK"** to save
+1. **Start** the app with `python main.py`
+2. Check **"Real-time Transcription"** for live transcription
+3. Check **"AI Cleanup"** to enable Gemini-powered correction (requires API key)
+4. Click **"Start Recording"** and join your meeting
+5. Watch the **Raw Transcript** pane fill with live text
+6. Every ~10 minutes, the **AI Cleaned** pane updates with corrected text
+7. Click **"Stop"** — a final AI pass generates the cleaned transcript + meeting summary
+8. **Copy** or **Save** the notes
 
-![Stereo Mix Setup](docs/stereo-mix-setup.png)
+## How It Works
 
-### Alternative: VB-Cable (If Stereo Mix Not Available)
+### Transcription Pipeline
 
-Some sound cards don't expose Stereo Mix. Use VB-Cable as an alternative:
+1. **Audio Capture** — Dual streams: microphone + system loopback (Stereo Mix)
+2. **Chunking** — Audio is processed in 5-second chunks with 1-second overlap
+3. **Whisper** — OpenAI Whisper (base model) runs on GPU for speech-to-text
+4. **Speaker Detection** — Each speech segment gets a speaker label via resemblyzer neural embeddings
+5. **Display** — Raw transcript appears in real-time in the left pane
 
-1. Download [VB-Cable](https://vb-audio.com/Cable/) (free virtual audio cable)
-2. Install and set as your default playback device
-3. In PawiScribe, the microphone will capture the "cable" output
-4. **Limitation:** You won't hear audio through your speakers while recording
+### AI Cleanup
 
-### Alternative: VoiceMeeter (Advanced)
+- **During recording** — Every ~10 minutes, Gemini corrects speech recognition errors (misheard words, broken sentences, wrong technical terms)
+- **After recording** — Final pass with full context produces a polished transcript + meeting summary with key decisions, action items, and topics discussed
 
-For more control over audio routing:
+### Speaker Diarization
 
-1. Download [VoiceMeeter Banana](https://vb-audio.com/Voicemeeter/banana.htm)
-2. Route system audio to both your speakers and a virtual microphone
-3. Select the virtual microphone in PawiScribe
+Uses [resemblyzer](https://github.com/resemble-ai/Resemblyzer) neural d-vector embeddings to differentiate speakers:
 
-## 📖 Usage
+- Automatically detects new speakers vs. returning speakers
+- Labels as `[Speaker 1]`, `[Speaker 2]`, etc.
+- Works per-segment using Whisper's word timestamps
+- Configurable similarity threshold (default: 0.69)
 
-1. **Configure Audio Sources:**
-   - Check **"Capture my microphone"** to record your voice
-   - Check **"Capture system audio"** to record meeting sound (requires Stereo Mix)
-   - Click **"Select Audio Devices..."** to choose specific devices
+## Configuration
 
-2. **Start Recording:** Click the green **"Start Recording"** button
+Edit `config.json`:
 
-3. **Join Your Meeting:** The app captures audio from both sources
-
-4. **Stop:** Click **"Stop & Transcribe"** when done
-
-5. **Wait:** Transcription happens locally (progress shown)
-
-6. **Export:** Copy to clipboard or save as Markdown file
-
-### Audio Source Indicators
-
-- 🎤 **Microphone**: Your voice (via selected input device)
-- 🔊 **System Audio**: Meeting audio from Teams/Zoom/Meet (via Stereo Mix loopback)
-
-## ⚙️ Settings
-
-- **Whisper Model:** Choose accuracy vs speed
-  - `tiny` - Fastest, lowest accuracy
-  - `base` - Balanced (recommended)
-  - `small` - Better accuracy, slower
-  - `medium/large` - Best accuracy, requires more RAM/CPU
-
-- **Ollama Summary:** Check to enable AI-generated summaries (requires Ollama)
-
-## 🔧 Advanced Setup
-
-### Installing Ollama (Optional)
-
-For AI-generated meeting summaries:
-
-1. Download and install Ollama from [ollama.com](https://ollama.com/)
-2. Open a terminal and pull a model:
-   ```bash
-   ollama pull llama3.2
-   # or
-   ollama pull phi4
-   ```
-3. Restart PawiScribe and enable "Use Ollama for Summary"
-
-### Optimizing for CPU-Only Systems
-
-If you don't have a GPU, use CPU-optimized PyTorch:
-
-```bash
-pip uninstall torch
-pip install torch --index-url https://download.pytorch.org/whl/cpu
+```json
+{
+  "whisper_model": "base",
+  "language": "en",
+  "sample_rate": 16000,
+  "gemini_api_key": "",
+  "auto_save": false,
+  "output_directory": "./notes",
+  "include_timestamps": true,
+  "summary_max_length": 500
+}
 ```
 
-### Faster Transcription (Optional)
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `whisper_model` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` | `base` |
+| `language` | Language code for transcription | `en` |
+| `gemini_api_key` | Google Gemini API key (leave empty to disable) | `""` |
+| `auto_save` | Auto-save notes on stop | `false` |
+| `output_directory` | Where to save exported notes | `./notes` |
 
-Replace `openai-whisper` with `faster-whisper` for 4x speedup:
+## Troubleshooting
 
-```bash
-pip uninstall openai-whisper
-pip install faster-whisper
-```
-
-Then modify `main.py` line 20 to use faster_whisper.
-
-## 🛠️ Troubleshooting
-
-### "No loopback device found" warning
-
-This means Stereo Mix is not enabled. Follow the [System Audio Setup](#-system-audio-setup) steps above.
-
-### "No audio recorded" error
-
-- Check that your microphone is connected and enabled in Windows
-- Check Windows Privacy Settings → Microphone → Allow apps to access microphone
-- Try a different microphone device via "Select Audio Devices..."
-
-### "Stereo Mix not available" on your PC
-
-Some sound cards (especially on laptops) don't expose Stereo Mix. Try:
-
-- Update your audio drivers from the manufacturer's website
-- Use VB-Cable or VoiceMeeter as alternatives (see above)
-- Use the microphone-only mode (still captures your side of the conversation)
-
-### Only one side of conversation is recorded
-
-- Make sure both **"Capture my microphone"** AND **"Capture system audio"** are checked
-- Verify Stereo Mix is enabled and selected as the system audio source
-- Test by playing audio while recording - you should see the recording level indicator respond
-
-### "Whisper model download fails"
-
-Models are downloaded automatically on first use. If it fails:
-```bash
-python -c "import whisper; whisper.load_model('base')"
-```
-
-### "Ollama not found"
-
-Make sure Ollama is installed and running. Test with:
-```bash
-ollama list
-```
+### "No loopback device found"
+Enable Stereo Mix in Windows Sound settings (see [System Audio Setup](#system-audio-setup)).
 
 ### Slow transcription
+- Use GPU: install PyTorch with CUDA (`pip install torch --index-url https://download.pytorch.org/whl/cu128`)
+- Use a smaller model (`tiny` instead of `base`)
+- Close other GPU-heavy apps
 
-- Use a smaller model (`tiny` or `base`)
-- Close other applications to free up RAM
-- Consider using `faster-whisper` (see Advanced Setup)
+### Gemini API errors (429)
+You're hitting rate limits. The app automatically handles this with periodic calls every ~10 minutes. If it persists, check your [quota](https://aistudio.google.com/apikey).
 
-## 📁 Output Format
+### No system audio captured
+- Verify Stereo Mix is enabled and not muted
+- Try VB-Cable as an alternative
+- Some laptops don't expose Stereo Mix — check your audio driver
 
-Saved meeting notes look like this:
+### DLL loading errors with torch
+The app includes an automatic DLL directory workaround for Windows. If you still get errors, ensure your CUDA toolkit matches your PyTorch version.
 
-```markdown
-# Meeting Notes - 2024-01-15
-
-**Date:** 2024-01-15  
-**Time:** 14:30  
-**Duration:** (recorded via PawiScribe)
-
----
-
-## Attendees
-
-- (Speaker names not automatically detected)
-
----
-
-## Summary
-
-(Key points and decisions from the meeting)
-
----
-
-## Transcript
-
-[00:00] Welcome everyone to the weekly sync...
-[00:45] Let's start with project updates...
-
----
-
-*Generated by PawiScribe - Local Meeting Notetaker*
-```
-
-## 🏗️ Building an Executable
-
-### Option 1: Download Pre-built Executable
-
-**No Python installation required!**
-
-Download `PawiScribe.exe` from the [Releases](https://github.com/yourusername/pawiscribe/releases) page and double-click to run.
-
-See [INSTALL.txt](INSTALL.txt) for detailed installation instructions.
-
-### Option 2: Build from Source (Windows)
-
-To create a standalone `.exe` file from source:
-
-```batch
-# Install PyInstaller
-pip install pyinstaller
-
-# Build using the spec file (recommended)
-pyinstaller pawiscribe.spec
-
-# Or build with command line (simpler but less optimized):
-pyinstaller --onefile --windowed --name PawiScribe --hidden-import=numpy --hidden-import=scipy --hidden-import=sounddevice --hidden-import=whisper --hidden-import=torch --hidden-import=PyQt6 main.py
-```
-
-The executable will be in `dist/PawiScribe.exe`
-
-For convenience, use the provided build script:
-```batch
-build_exe.bat
-```
-
-### Build Requirements
-
-- Windows 10/11 (building on Windows is required for Windows executables)
-- Python 3.9+ with all dependencies installed (`pip install -r requirements.txt`)
-- PyInstaller (`pip install pyinstaller`)
-- ~2GB free disk space for build process
-- ~5-15 minutes build time depending on system
-
-### What's Included in the Executable
-
-The standalone `.exe` includes:
-- Python runtime
-- All required libraries (PyQt6, Whisper, Torch, etc.)
-- Configuration file
-- **Excludes:** Whisper model files (downloaded on first run, ~150MB)
-
-### Distribution Size
-
-- **PawiScribe.exe**: ~200-500 MB (varies with compression)
-- **First run download**: ~150 MB (Whisper model)
-- **Total after first run**: ~350-650 MB
-
-### Known Limitations of Standalone Build
-
-1. **First Run Model Download**: The Whisper model (~150MB) is downloaded on first use, not bundled in the .exe
-2. **Windows Defender**: May show SmartScreen warning since the app isn't code-signed
-3. **Antivirus**: Some antivirus software may flag PyInstaller-built executables (false positive)
-4. **Stereo Mix**: Still requires manual enable in Windows sound settings
-5. **No macOS/Linux**: The .exe is Windows-only
-
-## 📋 System Requirements
+## System Requirements
 
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
 | OS | Windows 10 | Windows 11 |
 | RAM | 4 GB | 8 GB+ |
-| Storage | 500 MB | 2 GB (for models) |
+| GPU | — | NVIDIA with CUDA |
+| VRAM | — | 4 GB+ |
+| Storage | 500 MB | 2 GB |
 | Microphone | Any | USB headset |
-| Internet | Not required | For initial install only |
-| Stereo Mix | Required for system audio | Native Windows support |
+| Internet | For Gemini API only | — |
 
-## 🤝 Contributing
+## Tech Stack
 
-Contributions welcome! Areas for improvement:
+- **[OpenAI Whisper](https://github.com/openai/whisper)** — Speech recognition
+- **[PyTorch](https://pytorch.org/)** — GPU acceleration
+- **[resemblyzer](https://github.com/resemble-ai/Resemblyzer)** — Speaker diarization via neural embeddings
+- **[Google Gemini](https://ai.google.dev/)** — AI transcript cleanup
+- **[PyQt6](https://www.riverbankcomputing.com/software/pyqt/)** — GUI framework
+- **[sounddevice](https://python-sounddevice.readthedocs.io/)** — Audio recording
 
-- Real-time transcription
-- Speaker diarization (who spoke when)
-- Better Windows integration
-- Support for other platforms (macOS/Linux)
+## Contributing
 
-## 📄 License
+Contributions welcome! Some ideas:
 
-MIT License - Feel free to use, modify, and distribute.
+- Support for macOS / Linux
+- Custom speaker names (assign names to detected voices)
+- Real-time speaker labels in the UI
+- Support for additional AI providers
+- Audio file import (transcribe pre-recorded meetings)
+- Multi-language support
 
-## 🙏 Credits
+## License
 
-- [OpenAI Whisper](https://github.com/openai/whisper) - Speech recognition
-- [Ollama](https://ollama.com/) - Local LLM inference
-- [PyQt6](https://www.riverbankcomputing.com/software/pyqt/) - GUI framework
-- [python-sounddevice](https://python-sounddevice.readthedocs.io/) - Audio recording with WASAPI
+MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
-**Made with ❤️ for private, offline productivity**
+**Built for private, productive meetings.**

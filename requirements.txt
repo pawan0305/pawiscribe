@@ -19,6 +19,12 @@ torch>=2.0.0
 # Use torch-cpu for smaller install on CPU-only systems:
 # --index-url https://download.pytorch.org/whl/cpu
 
+# Speaker diarization (neural voice embeddings)
+resemblyzer>=0.1.4
+
+# AI transcript cleanup (Gemini API)
+google-generativeai>=0.8.0
+
 # Optional but recommended
 tqdm>=4.65.0  # Progress bars
 
