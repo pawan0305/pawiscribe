@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PawiScribe v2.0.0 - Local Meeting Notetaker - Apple Style UI
+PawiScribe v3.0.0 - Local Meeting Notetaker - Apple Style UI
 Records audio (microphone + system audio), transcribes with Whisper.
 Differentiates speakers using mic vs system audio energy.
 100% offline - no API calls required
@@ -9,7 +9,7 @@ Author: PawiBot Team
 License: MIT
 """
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 import sys
 import os
